@@ -28,12 +28,22 @@
 /* for mmap */
 #include <sys/mman.h>
 
+#include <drm_fourcc.h>
+
 #include <xkbcommon/xkbcommon.h>
 #include <xkbcommon/xkbcommon-compose.h>
 #include <locale.h>
 
 #include "xdg-shell-client.h"
 #include "fullscreen-shell-unstable-v1-client.h"
+#include "linux-dmabuf-unstable-v1-client.h"
+
+#if COG_ENABLE_PROTECTED_CONTENT
+#include "weston-direct-display-client-protocol.h"
+#include "weston-content-protection-client-protocol.h"
+#endif
+
+#include <wpe/extensions/video-plane-display-dmabuf.h>
 
 #if COG_IM_API_SUPPORTED
 #include "cog-im-context-fdo.h"
@@ -53,6 +63,27 @@
 # define HAVE_DEVICE_SCALING 0
 #endif /* WPE_CHECK_VERSION */
 
+#define BUFFER_FORMAT DRM_FORMAT_YUYV
+
+struct buffer {
+    struct wl_buffer *buffer;
+
+    int32_t x;
+    int32_t y;
+    int32_t width;
+    int32_t height;
+    int fd;
+
+    struct wpe_video_plane_display_dmabuf_export* dmabuf_export;
+};
+
+typedef struct {
+#if COG_ENABLE_PROTECTED_CONTENT
+    struct weston_protected_surface *protected_surface;
+#endif
+    struct wl_surface *wl_surface;
+    struct wl_subsurface *wl_subsurface;
+} video_surface;
 
 #ifndef EGL_WL_create_wayland_buffer_from_image
 typedef struct wl_buffer * (EGLAPIENTRYP PFNEGLCREATEWAYLANDBUFFERFROMIMAGEWL) (EGLDisplay dpy, EGLImageKHR image);
@@ -71,12 +102,22 @@ static struct {
     struct wl_display *display;
     struct wl_registry *registry;
     struct wl_compositor *compositor;
+    struct wl_subcompositor *subcompositor;
+
+    struct zwp_linux_dmabuf_v1 *dmabuf;
+    uint64_t *modifiers;
+    int modifiers_count;
 
     struct xdg_wm_base *xdg_shell;
     struct zwp_fullscreen_shell_v1 *fshell;
     struct wl_shell *shell;
 
     struct wl_seat *seat;
+
+#if COG_ENABLE_PROTECTED_CONTENT
+    struct weston_direct_display_v1 *direct_display;
+    struct weston_content_protection *protection;
+#endif
 
 #if HAVE_DEVICE_SCALING
     struct output_metrics metrics[16];
@@ -137,6 +178,8 @@ static struct {
     struct wl_surface *wl_surface;
     struct wl_egl_window *egl_window;
     EGLSurface egl_surface;
+
+    GHashTable *video_surfaces;
 
     struct xdg_surface *xdg_surface;
     struct xdg_toplevel *xdg_toplevel;
@@ -450,6 +493,35 @@ static const struct wl_surface_listener surface_listener = {
 #endif /* HAVE_DEVICE_SCALING */
 
 static void
+dmabuf_modifiers(void *data, struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf,
+                 uint32_t format, uint32_t modifier_hi, uint32_t modifier_lo)
+{
+    switch (format) {
+    case BUFFER_FORMAT:
+        ++wl_data.modifiers_count;
+        wl_data.modifiers = realloc(wl_data.modifiers,
+                                    wl_data.modifiers_count * sizeof(*wl_data.modifiers));
+        wl_data.modifiers[wl_data.modifiers_count - 1] =
+            ((uint64_t)modifier_hi << 32) | modifier_lo;
+		break;
+    default:
+        break;
+    }
+}
+
+static void
+dmabuf_format(void *data, struct zwp_linux_dmabuf_v1 *zwp_linux_dmabuf, uint32_t format)
+{
+    /* deprecated */
+}
+
+static const struct zwp_linux_dmabuf_v1_listener dmabuf_listener = {
+    dmabuf_format,
+    dmabuf_modifiers
+};
+
+
+static void
 registry_global (void               *data,
                  struct wl_registry *registry,
                  uint32_t            name,
@@ -463,6 +535,16 @@ registry_global (void               *data,
                                                name,
                                                &wl_compositor_interface,
                                                version);
+    } else if (strcmp (interface, wl_subcompositor_interface.name) == 0) {
+            wl_data.subcompositor = wl_registry_bind (registry,
+                                                      name,
+                                                      &wl_subcompositor_interface,
+                                                      version);
+    } else if (strcmp (interface, zwp_linux_dmabuf_v1_interface.name) == 0) {
+        if (version < 3)
+            return;
+        wl_data.dmabuf = wl_registry_bind (registry, name, &zwp_linux_dmabuf_v1_interface, 3);
+        zwp_linux_dmabuf_v1_add_listener (wl_data.dmabuf, &dmabuf_listener, NULL);
     } else if (strcmp (interface, wl_shell_interface.name) == 0) {
         wl_data.shell = wl_registry_bind (registry,
                                           name,
@@ -486,6 +568,18 @@ registry_global (void               *data,
                                          name,
                                          &wl_seat_interface,
                                          version);
+#if COG_ENABLE_PROTECTED_CONTENT
+    } else if (strcmp (interface, "weston_direct_display_v1") == 0) {
+        wl_data.direct_display = wl_registry_bind (registry,
+                                                   name,
+                                                   &weston_direct_display_v1_interface,
+                                                   1);
+    } else if (strcmp (interface, "weston_content_protection") == 0) {
+        wl_data.protection = wl_registry_bind (registry,
+                                               name,
+                                               &weston_content_protection_interface,
+                                               1);
+#endif /* COG_ENABLE_PROTECTED_CONTENT */
 #if HAVE_DEVICE_SCALING
     } else if (strcmp (interface, wl_output_interface.name) == 0) {
         struct wl_output* output = wl_registry_bind (registry,
@@ -715,7 +809,6 @@ keyboard_on_enter (void *data,
                    struct wl_surface *surface,
                    struct wl_array *keys)
 {
-    g_assert (surface == win_data.wl_surface);
     wl_data.keyboard.serial = serial;
 }
 
@@ -1190,6 +1283,36 @@ static const struct wl_buffer_listener buffer_listener = {
 };
 
 static void
+on_dmabuf_surface_frame (void *data, struct wl_callback *callback, uint32_t time)
+{
+    // for WAYLAND_DEBUG=1 purposes only
+    wl_callback_destroy (callback);
+}
+
+static const struct wl_callback_listener dmabuf_frame_listener = {
+    .done = on_dmabuf_surface_frame,
+};
+
+static void
+on_dmabuf_buffer_release (void* data, struct wl_buffer* buffer)
+{
+    struct buffer *data_buffer = data;
+    if (data_buffer->fd >= 0)
+        close(data_buffer->fd);
+
+    if (data_buffer->dmabuf_export)
+        wpe_video_plane_display_dmabuf_export_release(data_buffer->dmabuf_export);
+
+    free (data_buffer);
+
+    g_clear_pointer (&buffer, wl_buffer_destroy);
+}
+
+static const struct wl_buffer_listener dmabuf_buffer_listener = {
+    .release = on_dmabuf_buffer_release,
+};
+
+static void
 on_export_fdo_egl_image(void *data, struct wpe_fdo_egl_exported_image *image)
 {
     wpe_view_data.image = image;
@@ -1226,6 +1349,134 @@ on_export_fdo_egl_image(void *data, struct wpe_fdo_egl_exported_image *image)
 
     wl_surface_commit (win_data.wl_surface);
 }
+
+static void
+create_succeeded(void *data,
+		 struct zwp_linux_buffer_params_v1 *params,
+		 struct wl_buffer *new_buffer)
+{
+	zwp_linux_buffer_params_v1_destroy (params);
+
+	struct buffer *buffer = data;
+	buffer->buffer = new_buffer;
+}
+
+static void
+create_failed(void *data, struct zwp_linux_buffer_params_v1 *params)
+{
+    struct buffer *buffer = data;
+
+    buffer->buffer = NULL;
+    zwp_linux_buffer_params_v1_destroy (params);
+    g_assert_not_reached ();
+}
+
+static const struct zwp_linux_buffer_params_v1_listener params_listener = {
+	create_succeeded,
+	create_failed
+};
+
+static void
+destroy_video_surface (gpointer data)
+{
+    video_surface *surface = (video_surface*) data;
+
+#if COG_ENABLE_PROTECTED_CONTENT
+    g_clear_pointer (&surface->protected_surface, weston_protected_surface_destroy);
+#endif
+    g_clear_pointer (&surface->wl_subsurface, wl_subsurface_destroy);
+    g_clear_pointer (&surface->wl_surface, wl_surface_destroy);
+
+    free (surface);
+}
+
+static void
+on_video_plane_display_dmabuf_receiver_handle_dmabuf (void* data, struct wpe_video_plane_display_dmabuf_export* dmabuf_export, uint32_t id, int fd, int32_t x, int32_t y, int32_t width, int32_t height, uint32_t stride)
+{
+    if (fd < 0)
+        return;
+
+    if (!wl_data.dmabuf) {
+        // TODO: Replace with g_warning_once() after bumping our GLib requirement.
+        static bool warning_emitted = false;
+        if (!warning_emitted) {
+            g_warning ("DMABuf not supported by the compositor. Video won't be rendered");
+            warning_emitted = true;
+        }
+        return;
+    }
+
+    uint64_t modifier = DRM_FORMAT_MOD_INVALID;
+    struct zwp_linux_buffer_params_v1 *params = zwp_linux_dmabuf_v1_create_params (wl_data.dmabuf);
+#if COG_ENABLE_PROTECTED_CONTENT
+    if (wl_data.direct_display != NULL)
+        weston_direct_display_v1_enable (wl_data.direct_display, params);
+#endif
+
+    video_surface *surf = (video_surface*) g_hash_table_lookup (win_data.video_surfaces, GUINT_TO_POINTER(id));
+    if (!surf) {
+        surf = calloc (1, sizeof (video_surface));
+        surf->wl_subsurface = NULL;
+        surf->wl_surface = wl_compositor_create_surface (wl_data.compositor);
+
+#if COG_ENABLE_PROTECTED_CONTENT
+        if (wl_data.protection) {
+            surf->protected_surface = weston_content_protection_get_protection (wl_data.protection, surf->wl_surface);
+            weston_protected_surface_enforce (surf->protected_surface);
+        }
+#endif
+        g_hash_table_insert (win_data.video_surfaces, GUINT_TO_POINTER (id), surf);
+    }
+
+    zwp_linux_buffer_params_v1_add (params, fd, 0, 0, stride, modifier >> 32, modifier & 0xffffffff);
+
+    if ((x + width) > win_data.width)
+        width -= x;
+
+    if ((y + height) > win_data.height)
+        height -= y;
+
+    struct buffer* buffer = calloc(1, sizeof(struct buffer));
+    buffer->fd = fd;
+    buffer->x = x;
+    buffer->y = y;
+    buffer->width = width;
+    buffer->height = height;
+	zwp_linux_buffer_params_v1_add_listener (params, &params_listener, buffer);
+
+    buffer->buffer = zwp_linux_buffer_params_v1_create_immed (params, buffer->width, buffer->height, BUFFER_FORMAT, 0);
+    zwp_linux_buffer_params_v1_destroy (params);
+
+    buffer->dmabuf_export = dmabuf_export;
+    wl_buffer_add_listener (buffer->buffer, &dmabuf_buffer_listener, buffer);
+
+    wl_surface_attach (surf->wl_surface, buffer->buffer, 0, 0);
+    wl_surface_damage (surf->wl_surface, 0, 0, buffer->width, buffer->height);
+
+    struct wl_callback *callback = wl_surface_frame (surf->wl_surface);
+    wl_callback_add_listener (callback, &dmabuf_frame_listener, NULL);
+
+    if (!surf->wl_subsurface) {
+        surf->wl_subsurface = wl_subcompositor_get_subsurface (wl_data.subcompositor,
+                                                               surf->wl_surface,
+                                                               win_data.wl_surface);
+        wl_subsurface_set_sync (surf->wl_subsurface);
+    }
+
+    wl_subsurface_set_position (surf->wl_subsurface, buffer->x, buffer->y);
+    wl_surface_commit (surf->wl_surface);
+}
+
+static void
+on_video_plane_display_dmabuf_receiver_end_of_stream (void* data, uint32_t id)
+{
+    g_hash_table_remove (win_data.video_surfaces, GUINT_TO_POINTER (id));
+}
+
+static const struct wpe_video_plane_display_dmabuf_receiver video_plane_display_dmabuf_receiver = {
+    .handle_dmabuf = on_video_plane_display_dmabuf_receiver_handle_dmabuf,
+    .end_of_stream = on_video_plane_display_dmabuf_receiver_end_of_stream,
+};
 
 static gboolean
 init_wayland (GError **error)
@@ -1267,8 +1518,18 @@ clear_wayland (void)
     if (wl_data.shell != NULL)
         wl_shell_destroy (wl_data.shell);
 
+    if (wl_data.subcompositor != NULL)
+        wl_subcompositor_destroy (wl_data.subcompositor);
+
     if (wl_data.compositor != NULL)
         wl_compositor_destroy (wl_data.compositor);
+
+#if COG_ENABLE_PROTECTED_CONTENT
+    if (wl_data.protection != NULL)
+        weston_content_protection_destroy (wl_data.protection);
+    if (wl_data.direct_display != NULL)
+        weston_direct_display_v1_destroy (wl_data.direct_display);
+#endif
 
     wl_registry_destroy (wl_data.registry);
     wl_display_flush (wl_data.display);
@@ -1381,6 +1642,8 @@ create_window (GError **error)
     win_data.wl_surface = wl_compositor_create_surface (wl_data.compositor);
     g_assert (win_data.wl_surface);
 
+    win_data.video_surfaces = g_hash_table_new_full (g_direct_hash, g_direct_hash, NULL, destroy_video_surface);
+
 #if HAVE_DEVICE_SCALING
     wl_surface_add_listener (win_data.wl_surface, &surface_listener, NULL);
 #endif /* HAVE_DEVICE_SCALING */
@@ -1488,6 +1751,8 @@ destroy_window (void)
     g_clear_pointer (&win_data.xdg_surface, xdg_surface_destroy);
     g_clear_pointer (&win_data.shell_surface, wl_shell_surface_destroy);
     g_clear_pointer (&win_data.wl_surface, wl_surface_destroy);
+
+    g_clear_pointer (&win_data.video_surfaces, g_hash_table_destroy);
 }
 
 static gboolean
@@ -1588,6 +1853,8 @@ cog_platform_setup (CogPlatform *platform,
 
     /* init WPE host data */
     wpe_fdo_initialize_for_egl_display (egl_data.display);
+
+    wpe_video_plane_display_dmabuf_register_receiver(&video_plane_display_dmabuf_receiver, NULL);
 
     return TRUE;
 }
